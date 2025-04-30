@@ -1,68 +1,39 @@
 from flask import Flask, request, jsonify
 from gradio_client import Client, file
+from PIL import Image
+from io import BytesIO
 import requests
 import os
 import traceback
-import concurrent.futures
 import psutil
 import signal
-from PIL import Image
-from io import BytesIO
 
 app = Flask(__name__)
 client = Client("AIRI-Institute/HairFastGAN")
 TMPFILES_UPLOAD_URL = "https://tmpfiles.org/api/v1/upload"
-MEMORY_THRESHOLD_MB = 900  # threshold in megabytes to force a restart
+MEMORY_THRESHOLD_MB = 900  # in megabytes
 
 
 def ensure_memory_or_restart():
     rss = psutil.Process(os.getpid()).memory_info().rss / 1024**2
     if rss > MEMORY_THRESHOLD_MB:
-        print(f"[MEMORY] {rss:.0f}MB > {MEMORY_THRESHOLD_MB}MB — killing process to force a cold start")
+        print(f"[MEMORY] {rss:.0f}MB > {MEMORY_THRESHOLD_MB}MB — killing process to force restart")
         os.kill(os.getpid(), signal.SIGKILL)
 
 
-def download_resize_upload(url):
-    """
-    Download an image, resize it to 480x480, upload it to tmpfiles.org, and return the new URL.
-    """
+def resize_and_upload(url):
     response = requests.get(url)
-    img = Image.open(BytesIO(response.content)).convert('RGB')
+    response.raise_for_status()
+
+    img = Image.open(BytesIO(response.content)).convert("RGB")
     img_resized = img.resize((480, 480))
 
-    temp_filename = "temp_resized.jpg"
-    img_resized.save(temp_filename)
+    img_byte_arr = BytesIO()
+    img_resized.save(img_byte_arr, format='JPEG')
+    img_byte_arr.seek(0)
 
-    with open(temp_filename, 'rb') as f:
-        files = {'file': (os.path.basename(temp_filename), f)}
-        resp = requests.post(TMPFILES_UPLOAD_URL, files=files)
-
-    if resp.status_code != 200:
-        raise Exception(f"Upload failed: {resp.status_code}: {resp.text}")
-
-    try:
-        result = resp.json()
-        uploaded_url = (result.get('data', {}).get('url') or
-                        result.get('url') or
-                        result.get('link') or
-                        result)
-    except ValueError:
-        uploaded_url = resp.text.strip()
-
-    if isinstance(uploaded_url, str) and uploaded_url.startswith("https://tmpfiles.org/") and "/dl/" not in uploaded_url:
-        uploaded_url = uploaded_url.replace("https://tmpfiles.org/", "https://tmpfiles.org/dl/")
-
-    os.remove(temp_filename)
-    return uploaded_url
-
-
-def upload_local_file(local_path):
-    """
-    Upload a local file to tmpfiles.org and return the direct-download URL.
-    """
-    with open(local_path, 'rb') as f:
-        files = {'file': (os.path.basename(local_path), f)}
-        resp = requests.post(TMPFILES_UPLOAD_URL, files=files)
+    files = {'file': ('resized.jpg', img_byte_arr, 'image/jpeg')}
+    resp = requests.post(TMPFILES_UPLOAD_URL, files=files)
 
     if resp.status_code != 200:
         raise Exception(f"Upload failed: {resp.status_code}: {resp.text}")
@@ -85,7 +56,6 @@ def upload_local_file(local_path):
 @app.route('/process-hair-swap', methods=['POST'])
 def process_hair_swap():
     ensure_memory_or_restart()
-
     data = request.get_json(force=True)
 
     face_url = data.get('face_url')
@@ -94,40 +64,20 @@ def process_hair_swap():
     if not all([face_url, shape_url, color_url]):
         return jsonify({"error": "face_url, shape_url, and color_url are required"}), 400
 
-    local_files = []
+    temp_urls = []
     try:
-        def process_image(url, api_name):
-            ensure_memory_or_restart()
+        # Resize and upload
+        face_resized_url = resize_and_upload(face_url)
+        shape_resized_url = resize_and_upload(shape_url)
+        color_resized_url = resize_and_upload(color_url)
+        temp_urls.extend([face_resized_url, shape_resized_url, color_resized_url])
 
-            # Step 1: download, resize, upload
-            resized_url = download_resize_upload(url)
-
-            # Step 2: Call Gradio with resized URL
-            output_path = client.predict(
-                img=file(resized_url),
-                align=["Face", "Shape", "Color"],
-                api_name=api_name
-            )
-            local_files.append(output_path)
-
-            # Step 3: Upload output
-            return upload_local_file(output_path)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            future_face = executor.submit(process_image, face_url, "/resize_inner")
-            future_shape = executor.submit(process_image, shape_url, "/resize_inner_1")
-            future_color = executor.submit(process_image, color_url, "/resize_inner_2")
-            face_dl_url = future_face.result()
-            shape_dl_url = future_shape.result()
-            color_dl_url = future_color.result()
-
+        # Predict hair swap
         ensure_memory_or_restart()
-
-        # Now swap hair
         swap_output = client.predict(
-            face=file(face_dl_url),
-            shape=file(shape_dl_url),
-            color=file(color_dl_url),
+            face=file(face_resized_url),
+            shape=file(shape_resized_url),
+            color=file(color_resized_url),
             blending=data.get('blending', "Article"),
             poisson_iters=int(data.get('poisson_iters', 2500)),
             poisson_erosion=int(data.get('poisson_erosion', 100)),
@@ -144,10 +94,11 @@ def process_hair_swap():
         else:
             swapped_local = swap_output
 
-        local_files.append(swapped_local)
+        # Re-upload final output if needed
+        swapped_final_url = resize_and_upload(swapped_local)
+        temp_urls.append(swapped_final_url)
 
-        swapped_dl_url = upload_local_file(swapped_local)
-        return jsonify({"result_url": swapped_dl_url}), 200
+        return jsonify({"result_url": swapped_final_url}), 200
 
     except Exception as e:
         print("Exception occurred:", e)
@@ -155,14 +106,8 @@ def process_hair_swap():
         return jsonify({"error": str(e)}), 500
 
     finally:
-        # Clean temp files
-        for path in local_files:
-            try:
-                if path and os.path.isfile(path):
-                    os.remove(path)
-            except OSError:
-                pass
-
+        # No local files to delete — only memory
+        temp_urls.clear()  # clear in-memory URL list to free memory
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
